@@ -282,7 +282,7 @@ int tp4ring_add_used(struct tpacket4_queue_kernel *q,
 	int i;
 	unsigned int used_idx = q->used_idx;
 
-	/* TODO: Completly unchecked, which is pretty much looking for trouble! */
+	/* TODO (bt): Completly unchecked, which is pretty much looking for trouble! */
 	for (i = 0; i < dcnt; i++) {
 		unsigned int idx = (used_idx++) & (q->ring_size - 1);
 
@@ -2629,6 +2629,10 @@ static int tpacket_snd(struct packet_sock *po, struct msghdr *msg)
 	int status = TP_STATUS_AVAILABLE;
 	int hlen, tlen, copylen = 0;
 
+	/* TODO (bt) Kick queue */
+	if (po->tp_version == TPACKET_V4)
+		return -EOPNOTSUPP;
+
 	mutex_lock(&po->pg_vec_lock);
 
 	if (likely(saddr == NULL)) {
@@ -2966,6 +2970,69 @@ static int packet_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
 		return packet_snd(sock, msg, len);
 }
 
+static int packet_alloc_tp4q(struct tpacket4_queue_kernel *queue,
+			     unsigned int nentries)
+{
+	/* TODO (bt) Make sure it fits into 32 pages... */
+
+	struct tpacket4_desc *r;
+	unsigned long size = sizeof(*queue->vring) * nentries;
+	gfp_t gfp_flags = GFP_ATOMIC | __GFP_ZERO;
+
+	r = (struct tpacket4_desc *)alloc_pages_exact(size, gfp_flags);
+	if (!r)
+		return -ENOMEM;
+
+	queue->vring = r;
+	queue->used_idx = 0;
+	queue->last_avail_idx = 0;
+	queue->ring_size = nentries;
+	return 0;
+}
+
+static void packet_free_tp4q(struct tpacket4_queue_kernel *queue)
+{
+	free_pages_exact(queue->vring, sizeof(*queue->vring) * queue->ring_size);
+	queue->vring = NULL;
+	queue->ring_size = 0;
+}
+
+static int packet_alloc_tp4bufs(struct tpacket4_buffers *bufs, unsigned int nentries)
+{
+	unsigned int i = 0, j;
+	gfp_t gfp_flags = GFP_ATOMIC | __GFP_ZERO;
+
+	bufs->pages = (struct page **)kzalloc(sizeof(*bufs->pages) * nentries, gfp_flags);
+	if (!bufs->pages)
+		goto out;
+
+	for (; i < nentries; i++) {
+		bufs->pages[i] = dev_alloc_page();
+		if (!bufs->pages[i])
+			goto out;
+	}
+	bufs->npages = nentries;
+	return 0;
+out:
+	for (j = 0; j < i; j++)
+		__free_pages(bufs->pages[j], 0);
+	bufs->npages = 0;
+	kfree(bufs->pages);
+	bufs->pages = NULL;
+	return -ENOMEM;
+}
+
+static void packet_free_tp4bufs(struct tpacket4_buffers *bufs)
+{
+	unsigned int i;
+
+	for (i = 0; i < bufs->npages; i++)
+		__free_pages(bufs->pages[i], 0);
+	bufs->npages = 0;
+	kfree(bufs->pages);
+	bufs->pages = NULL;
+}
+
 /*
  *	Close a PACKET socket. This is fairly simple. We immediately go
  *	to 'closed' state and remove our protocol entry in the device list.
@@ -2998,6 +3065,10 @@ static int packet_release(struct socket *sock)
 	packet_cached_dev_reset(po);
 
 	if (po->prot_hook.dev) {
+		if (po->tp_version == TPACKET_V4) {
+			po->prot_hook.dev->netdev_ops->ndo_ddma_unmap(
+				po->prot_hook.dev, po->tp4_chan);
+		}
 		dev_put(po->prot_hook.dev);
 		po->prot_hook.dev = NULL;
 	}
@@ -3014,6 +3085,13 @@ static int packet_release(struct socket *sock)
 		memset(&req_u, 0, sizeof(req_u));
 		packet_set_ring(sk, &req_u, 1, 1);
 	}
+
+	if (po->rx_tp4q.vring)
+		packet_free_tp4q(&po->rx_tp4q);
+	if (po->tx_tp4q.vring)
+		packet_free_tp4q(&po->tx_tp4q);
+	if (po->tp4_bufs.pages)
+		packet_free_tp4bufs(&po->tp4_bufs);
 
 	f = fanout_release(sk);
 
@@ -3120,6 +3198,14 @@ static int packet_do_bind(struct sock *sk, const char *name, int ifindex,
 		sk->sk_err = ENETDOWN;
 		if (!sock_flag(sk, SOCK_DEAD))
 			sk->sk_error_report(sk);
+	}
+
+	if (po->tp_version == TPACKET_V4) {
+		if (!dev->netdev_ops->ndo_ddma_map) {
+			ret = -EOPNOTSUPP;
+			goto out_unlock;
+		}
+		ret = dev->netdev_ops->ndo_ddma_map(dev, po->tp4_chan, &po->rx_tp4q, &po->tp4_bufs);
 	}
 
 out_unlock:
@@ -3276,6 +3362,10 @@ static int packet_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
 	if (pkt_sk(sk)->ifindex < 0)
 		return -ENODEV;
 #endif
+
+	/* TODO (bt) Kick queue */
+	if (pkt_sk(sk)->tp_version == TPACKET_V4)
+		return -EOPNOTSUPP;
 
 	if (flags & MSG_ERRQUEUE) {
 		err = sock_recv_errqueue(sk, msg, len,
@@ -3636,9 +3726,10 @@ packet_setsockopt(struct socket *sock, int level, int optname, char __user *optv
 			len = sizeof(req_u.req);
 			break;
 		case TPACKET_V3:
-		default:
 			len = sizeof(req_u.req3);
 			break;
+		default:
+			return -EINVAL;
 		}
 		if (optlen < len)
 			return -EINVAL;
@@ -3671,12 +3762,16 @@ packet_setsockopt(struct socket *sock, int level, int optname, char __user *optv
 		case TPACKET_V1:
 		case TPACKET_V2:
 		case TPACKET_V3:
+		case TPACKET_V4:
 			break;
 		default:
 			return -EINVAL;
 		}
 		lock_sock(sk);
 		if (po->rx_ring.pg_vec || po->tx_ring.pg_vec) {
+			ret = -EBUSY;
+		} else if (po->rx_tp4q.vring || po->rx_tp4q.vring ||
+			   po->tp4_bufs.pages) {
 			ret = -EBUSY;
 		} else {
 			po->tp_version = val;
@@ -3804,6 +3899,39 @@ packet_setsockopt(struct socket *sock, int level, int optname, char __user *optv
 			return -EFAULT;
 
 		po->xmit = val ? packet_direct_xmit : dev_queue_xmit;
+		return 0;
+	}
+	case PACKET_DIRECT:
+	{
+		struct tpacket_req4 req;
+		int len, err;
+
+		if (po->tp_version != TPACKET_V4)
+			return -EINVAL;
+
+		len = sizeof(req);
+
+		if (optlen < len)
+			return -EINVAL;
+		if (copy_from_user(&req, optval, len))
+			return -EFAULT;
+
+		if (req.tp_rx_nr && !po->rx_tp4q.vring) {
+			err = packet_alloc_tp4q(&po->rx_tp4q, req.tp_rx_nr);
+			if (err)
+				return err;
+		}
+		if (req.tp_tx_nr && !po->tx_tp4q.vring) {
+			err = packet_alloc_tp4q(&po->tx_tp4q, req.tp_tx_nr);
+			if (err)
+				return err;
+		}
+		if (req.tp_buf_nr && !po->tp4_bufs.pages) {
+			err = packet_alloc_tp4bufs(&po->tp4_bufs, req.tp_buf_nr);
+			if (err)
+				return err;
+		}
+		po->tp4_chan = req.tp_chan;
 		return 0;
 	}
 	default:
@@ -4057,6 +4185,8 @@ static unsigned int packet_poll(struct file *file, struct socket *sock,
 	struct packet_sock *po = pkt_sk(sk);
 	unsigned int mask = datagram_poll(file, sock, wait);
 
+	/* TODO (bt) Implement! */
+
 	spin_lock_bh(&sk->sk_receive_queue.lock);
 	if (po->rx_ring.pg_vec) {
 		if (!packet_previous_rx_frame(po, &po->rx_ring,
@@ -4187,6 +4317,9 @@ static int packet_set_ring(struct sock *sk, union tpacket_req_u *req_u,
 	struct tpacket_req *req = &req_u->req;
 
 	lock_sock(sk);
+	if (po->tp_version == TPACKET_V4)
+		goto out;
+
 	/* Opening a Tx-ring is NOT supported in TPACKET_V3 */
 	if (!closing && tx_ring && (po->tp_version > TPACKET_V2)) {
 		net_warn_ratelimited("Tx-ring is not supported.\n");
@@ -4220,6 +4353,9 @@ static int packet_set_ring(struct sock *sk, union tpacket_req_u *req_u,
 		case TPACKET_V3:
 			po->tp_hdrlen = TPACKET3_HDRLEN;
 			break;
+		default:
+			err = -EINVAL;
+			goto out;
 		}
 
 		err = -EINVAL;
@@ -4334,6 +4470,73 @@ static int packet_mmap(struct file *file, struct socket *sock,
 	unsigned long start;
 	int err = -EINVAL;
 	int i;
+
+	if (po->tp_version == TPACKET_V4) {
+		unsigned long uaddr;
+
+		size = vma->vm_end - vma->vm_start;
+
+		/* We're overloading the vma->vm_pgoff for the
+                 * different rings/buffer area. */
+		if (vma->vm_pgoff == 0 || vma->vm_pgoff == 32) {
+			struct tpacket4_queue_kernel *q;
+			unsigned long addr, end;
+
+			q = (vma->vm_pgoff == 0) ? &po->rx_tp4q : &po->tx_tp4q;
+
+			expected_size = sizeof(*q->vring) * q->ring_size;
+
+			if (expected_size == 0)
+				return -EINVAL;
+
+			if (size != expected_size)
+				return -EINVAL;
+
+			uaddr = vma->vm_start;
+			addr = (unsigned long)q->vring;
+			end = addr + PAGE_ALIGN(sizeof(*q->vring) * q->ring_size);
+
+			while (addr < end) {
+				err = vm_insert_page(vma, uaddr, virt_to_page(addr));
+				if (err)
+					return err;
+
+				addr += PAGE_SIZE;
+				uaddr += PAGE_SIZE;
+			}
+
+			err = 0;
+		} else if (vma->vm_pgoff == 64) {
+			expected_size = po->tp4_bufs.npages * PAGE_SIZE;
+
+			if (expected_size == 0) {
+				pr_err("BT 3\n");
+				return -EINVAL;
+			}
+			if (size != expected_size) {
+				pr_err("BT 4\n");
+				return -EINVAL;
+			}
+
+			uaddr = vma->vm_start;
+
+			for (i = 0; i < (int)po->tp4_bufs.npages; i++) {
+				err = vm_insert_page(vma, uaddr, po->tp4_bufs.pages[i]);
+				if (err)
+					return err;
+
+				uaddr += PAGE_SIZE;
+			}
+
+			err = 0;
+		}
+
+		if (err == 0) {
+			atomic_inc(&po->mapped);
+			vma->vm_ops = &packet_mmap_ops;
+		}
+		return err;
+	}
 
 	if (vma->vm_pgoff)
 		return -EINVAL;

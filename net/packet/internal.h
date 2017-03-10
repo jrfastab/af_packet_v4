@@ -1,6 +1,8 @@
 #ifndef __PACKET_INTERNAL_H__
 #define __PACKET_INTERNAL_H__
 
+#include <linux/tp4queue.h>
+
 struct packet_mclist {
 	struct packet_mclist	*next;
 	int			ifindex;
@@ -107,6 +109,13 @@ struct packet_sock {
 	union  tpacket_stats_u	stats;
 	struct packet_ring_buffer	rx_ring;
 	struct packet_ring_buffer	tx_ring;
+
+	/*  */
+	struct tpacket4_queue_kernel rx_tp4q;
+	struct tpacket4_queue_kernel tx_tp4q;
+	struct tpacket4_buffers tp4_bufs;
+	unsigned int tp4_chan;
+
 	int			copy_thresh;
 	spinlock_t		bind_lock;
 	struct mutex		pg_vec_lock;
