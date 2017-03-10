@@ -53,6 +53,7 @@
 #include <uapi/linux/if_bonding.h>
 #include <uapi/linux/pkt_cls.h>
 #include <linux/hashtable.h>
+#include <linux/tp4queue.h>
 
 struct netpoll_info;
 struct device;
@@ -1325,6 +1326,14 @@ struct net_device_ops {
 						       int needed_headroom);
 	int			(*ndo_xdp)(struct net_device *dev,
 					   struct netdev_xdp *xdp);
+
+	/* For now, only Rx. Think about how Tx would fit into an ndo... */
+	int			(*ndo_ddma_map)(struct net_device *dev,
+						unsigned int rindex,
+						struct tpacket4_queue_kernel *q,
+						struct tpacket4_buffers *bufs);
+	void			(*ndo_ddma_unmap)(struct net_device *dev,
+						  unsigned int rindex);
 };
 
 /**
