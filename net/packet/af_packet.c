@@ -247,6 +247,61 @@ struct packet_skb_cb {
 static void __fanout_unlink(struct sock *sk, struct packet_sock *po);
 static void __fanout_link(struct sock *sk, struct packet_sock *po);
 
+/**
+ *
+ */
+int tp4ring_get_avail(struct tpacket4_queue_kernel *q,
+		      struct tpacket4_desc *d, int dcnt)
+{
+	int i, entries = 0;
+	unsigned int idx, last_avail_idx = q->last_avail_idx;
+
+	for (i = 0; i < dcnt; i++) {
+		idx = (last_avail_idx++) & (q->ring_size - 1);
+		if (!(q->vring[idx].flags & DESC_HW))
+			break;
+		entries++;
+	}
+
+	smp_rmb();
+
+	for (i = 0; i < entries; i++) {
+		idx = (q->last_avail_idx++) & (q->ring_size - 1);
+		d[i] = q->vring[idx];
+	}
+	return entries;
+}
+EXPORT_SYMBOL(tp4ring_get_avail);
+
+/**
+ *
+ */
+int tp4ring_add_used(struct tpacket4_queue_kernel *q,
+		     const struct tpacket4_desc *d, int dcnt)
+{
+	int i;
+	unsigned int used_idx = q->used_idx;
+
+	/* TODO: Completly unchecked, which is pretty much looking for trouble! */
+	for (i = 0; i < dcnt; i++) {
+		unsigned int idx = (used_idx++) & (q->ring_size - 1);
+
+		q->vring[idx].addr = d[i].addr;
+		q->vring[idx].len = d[i].len;
+		/* Don't touch ring index. */
+	}
+
+	smp_wmb();
+
+	for (i = 0; i < dcnt; i++) {
+		unsigned int idx = (q->used_idx++) & (q->ring_size - 1);
+
+		q->vring[idx].flags = d[i].flags & ~DESC_HW;
+	}
+	return 0;
+}
+EXPORT_SYMBOL(tp4ring_add_used);
+
 static int packet_direct_xmit(struct sk_buff *skb)
 {
 	struct net_device *dev = skb->dev;
