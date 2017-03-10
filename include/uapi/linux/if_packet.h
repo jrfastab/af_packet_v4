@@ -56,6 +56,7 @@ struct sockaddr_ll {
 #define PACKET_QDISC_BYPASS		20
 #define PACKET_ROLLOVER_STATS		21
 #define PACKET_FANOUT_DATA		22
+#define PACKET_DIRECT			23
 
 #define PACKET_FANOUT_HASH		0
 #define PACKET_FANOUT_LB		1
@@ -242,13 +243,48 @@ struct tpacket_block_desc {
 	union tpacket_bd_header_u hdr;
 };
 
+/* virtio 1.1 packed descriptor ring
+ * https://lists.oasis-open.org/archives/virtio-dev/201702/msg00010.html
+ */
+#define DESC_HW 0x0080
+
+struct tpacket4_desc {
+	__u64 addr;
+	__u32 len;
+	__u16 flags; /* flags from linux/virtio_ring.h header file */
+	__u16 index;
+};
+
+struct tpacket4_hdr {
+	void *data;
+	void *data_end;
+	void *data_hard_start;
+	/* TODO: padding? position/index? */
+};
+
+struct tpacket4_queue {
+	struct tpacket4_desc *vring;
+
+	unsigned int avail_idx;
+	unsigned int last_used_idx;
+	unsigned int num_free;
+	unsigned int ring_size;
+};
+
+enum tpacket4_mmap_offset {
+	TPACKET4_MMAP_OFFSET_RX_RING = 0,
+	TPACKET4_MMAP_OFFSET_TX_RING = 32,
+	TPACKET4_MMAP_OFFSET_BUFFERS = 64
+};
+
 #define TPACKET2_HDRLEN		(TPACKET_ALIGN(sizeof(struct tpacket2_hdr)) + sizeof(struct sockaddr_ll))
 #define TPACKET3_HDRLEN		(TPACKET_ALIGN(sizeof(struct tpacket3_hdr)) + sizeof(struct sockaddr_ll))
 
 enum tpacket_versions {
 	TPACKET_V1,
 	TPACKET_V2,
-	TPACKET_V3
+	TPACKET_V3,
+	TPACKET_V4
 };
 
 /*
@@ -281,9 +317,17 @@ struct tpacket_req3 {
 	unsigned int	tp_feature_req_word;
 };
 
+struct tpacket_req4 {
+	unsigned int tp_chan;   /* rx_ring selector, "channel" as used by ethtool */
+	unsigned int tp_buf_nr; /* number of buffer entries */
+	unsigned int tp_rx_nr;  /* number of entries in Rx vring */
+	unsigned int tp_tx_nr;  /* number of entries in Tx vring */
+};
+
 union tpacket_req_u {
 	struct tpacket_req	req;
 	struct tpacket_req3	req3;
+	/* Add req4 here? */
 };
 
 struct packet_mreq {
