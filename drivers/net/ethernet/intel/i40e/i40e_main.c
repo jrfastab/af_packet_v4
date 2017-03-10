@@ -9233,6 +9233,108 @@ out_err:
 	return features & ~(NETIF_F_CSUM_MASK | NETIF_F_GSO_MASK);
 }
 
+static
+int i40e_ddma_map(struct net_device *dev,
+		  unsigned int rindex,
+		  struct tpacket4_queue_kernel *q,
+		  struct tpacket4_buffers *bufs)
+{
+	struct i40e_netdev_priv *np = netdev_priv(dev);
+	struct i40e_vsi *vsi = np->vsi;
+	struct i40e_pf *pf = vsi->back;
+	struct i40e_ring *rx_ring;
+	struct i40e_rx_buffer *tp4_bufs_bi;
+	unsigned int i;
+	int err;
+
+	if (vsi->type != I40E_VSI_MAIN)
+		return -EINVAL;
+
+	/* ring index in range? */
+	if (rindex >= vsi->num_queue_pairs)
+		return -EINVAL;
+
+	rx_ring = vsi->rx_rings[rindex];
+
+	/* Sanity check that we're alone. Fix this! */
+	if (rx_ring->ddma)
+		return -EBUSY;
+
+	tp4_bufs_bi = (struct i40e_rx_buffer *)kzalloc(
+		sizeof(*tp4_bufs_bi) * bufs->npages, GFP_ATOMIC);
+
+	if (!tp4_bufs_bi)
+		return -ENOMEM;
+
+	/* DMA map all the buffers in bufs up front, and sync prior
+         * kicking userspace. Is this sane? Strictly user land owns
+         * the buffer until they show up on the avail queue. However,
+         * mapping should be ok. */
+	for (i = 0; i < bufs->npages; i++) {
+		dma_addr_t dma;
+
+		dma = dma_map_page(rx_ring->dev, bufs->pages[i], 0,
+				   PAGE_SIZE, DMA_FROM_DEVICE);
+		if (dma_mapping_error(rx_ring->dev, dma)) {
+			err = -EBUSY;
+			goto out;
+		}
+
+		tp4_bufs_bi[i].page = bufs->pages[i];
+		tp4_bufs_bi[i].dma = dma;
+	}
+
+	/* Is this really needed? Seems a bit heavy... */
+	i40e_prep_for_reset(pf);
+
+	rx_ring->ddma = true;
+	rx_ring->rx_tp4q = q;
+	rx_ring->tp4_bufs = bufs;
+	rx_ring->tp4_bufs_bi = tp4_bufs_bi;
+
+	i40e_reset_and_rebuild(pf, false);
+	return 0;
+out:
+	/* TODO unwind DMA... */
+	kfree(tp4_bufs_bi);
+	return err;
+}
+
+void i40e_ddma_unmap(struct net_device *dev,
+		     unsigned int rindex)
+{
+	struct i40e_netdev_priv *np = netdev_priv(dev);
+	struct i40e_vsi *vsi = np->vsi;
+	struct i40e_pf *pf = vsi->back;
+	struct i40e_ring *rx_ring;
+	unsigned int i;
+
+	/* ring index in range? */
+	if (rindex >= vsi->num_queue_pairs) {
+		dev_err(&pf->pdev->dev, "i40e_ddma_unmap got incorrect rindex = %d!\n", rindex);
+		return;
+	}
+
+	rx_ring = vsi->rx_rings[rindex];
+
+	/* Is this really needed? Seems a bit heavy... */
+	i40e_prep_for_reset(pf);
+
+	/* Unmap DMA */
+	for (i = 0; i < rx_ring->tp4_bufs->npages; i++) {
+		dma_unmap_page(rx_ring->dev, rx_ring->tp4_bufs_bi[i].dma,
+			       PAGE_SIZE, DMA_FROM_DEVICE);
+	}
+
+	kfree(rx_ring->tp4_bufs_bi);
+	rx_ring->tp4_bufs_bi = NULL;
+	rx_ring->ddma = false;
+	rx_ring->rx_tp4q = NULL;
+	rx_ring->tp4_bufs = NULL;
+
+	i40e_reset_and_rebuild(pf, false);
+}
+
 static const struct net_device_ops i40e_netdev_ops = {
 	.ndo_open		= i40e_open,
 	.ndo_stop		= i40e_close,
@@ -9269,6 +9371,8 @@ static const struct net_device_ops i40e_netdev_ops = {
 	.ndo_features_check	= i40e_features_check,
 	.ndo_bridge_getlink	= i40e_ndo_bridge_getlink,
 	.ndo_bridge_setlink	= i40e_ndo_bridge_setlink,
+	.ndo_ddma_map		= i40e_ddma_map,
+	.ndo_ddma_unmap		= i40e_ddma_unmap
 };
 
 /**

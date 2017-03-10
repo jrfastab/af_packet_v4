@@ -1013,6 +1013,9 @@ void i40e_clean_rx_ring(struct i40e_ring *rx_ring)
 	if (!rx_ring->rx_bi)
 		return;
 
+	if (rx_ring->ddma)
+		return;
+
 	/* Free all the Rx ring sk_buffs */
 	for (i = 0; i < rx_ring->count; i++) {
 		struct i40e_rx_buffer *rx_bi = &rx_ring->rx_bi[i];
@@ -1024,8 +1027,14 @@ void i40e_clean_rx_ring(struct i40e_ring *rx_ring)
 		if (!rx_bi->page)
 			continue;
 
-		dma_unmap_page(dev, rx_bi->dma, PAGE_SIZE, DMA_FROM_DEVICE);
-		__free_pages(rx_bi->page, 0);
+		if (rx_ring->ddma) {
+			/* What is proper clean up? Rewind the last avail? */
+			/* So hacky, and might be broken. */
+			rx_ring->rx_tp4q->last_avail_idx--;
+		} else {
+			dma_unmap_page(dev, rx_bi->dma, PAGE_SIZE, DMA_FROM_DEVICE);
+			__free_pages(rx_bi->page, 0);
+		}
 
 		rx_bi->page = NULL;
 		rx_bi->page_offset = 0;
@@ -1189,6 +1198,28 @@ static void i40e_receive_skb(struct i40e_ring *rx_ring,
 	napi_gro_receive(&q_vector->napi, skb);
 }
 
+static bool i40_get_page_from_tp4(struct i40e_ring *rx_ring,
+				  struct i40e_rx_buffer *bi)
+{
+	struct tpacket4_desc desc;
+	int nbufs;
+	unsigned long idx;
+
+	nbufs = tp4ring_get_avail(rx_ring->rx_tp4q, &desc, 1);
+	if (nbufs == 0)
+		return false;
+
+	idx = desc.addr;
+	if (idx >= rx_ring->tp4_bufs->npages)
+		return false;
+
+	bi->dma = rx_ring->tp4_bufs_bi[idx].dma;
+	bi->page = rx_ring->tp4_bufs_bi[idx].page;
+	bi->page_offset = 0;
+	bi->tp4_index = idx;
+	return true;
+}
+
 /**
  * i40e_alloc_rx_buffers - Replace used receive buffers
  * @rx_ring: ring to place buffers on
@@ -1210,8 +1241,14 @@ bool i40e_alloc_rx_buffers(struct i40e_ring *rx_ring, u16 cleaned_count)
 	bi = &rx_ring->rx_bi[ntu];
 
 	do {
-		if (!i40e_alloc_mapped_page(rx_ring, bi))
-			goto no_buffers;
+		if (rx_ring->ddma) {
+			/* TODO (bt) Don't pull one at a time... */
+			if (!i40_get_page_from_tp4(rx_ring, bi))
+				goto no_buffers;
+		} else {
+			if (!i40e_alloc_mapped_page(rx_ring, bi))
+				goto no_buffers;
+		}
 
 		/* Refresh the desc even if buffer_addrs didn't change
 		 * because each write-back erases this info.
@@ -1715,6 +1752,45 @@ static bool i40e_is_non_eop(struct i40e_ring *rx_ring,
 	return true;
 }
 
+static int i40e_do_ddma(struct i40e_ring *rx_ring,
+			union i40e_rx_desc *rx_desc)
+{
+	struct i40e_rx_buffer *rx_buffer;
+	struct page *page;
+	struct tpacket4_desc tp4desc = {};
+	int err;
+	u64 qword = le64_to_cpu(rx_desc->wb.qword1.status_error_len);
+	unsigned int size = (qword & I40E_RXD_QW1_LENGTH_PBUF_MASK) >>
+			    I40E_RXD_QW1_LENGTH_PBUF_SHIFT;
+
+	rx_buffer = &rx_ring->rx_bi[rx_ring->next_to_clean];
+	page = rx_buffer->page;
+	prefetchw(page);
+
+	/* TODO (bt) write header and use page_offset for that */
+
+	dma_sync_single_for_cpu(rx_ring->dev,
+				rx_buffer->dma,
+				PAGE_SIZE,
+				DMA_FROM_DEVICE);
+
+	/* Pass the frame to userland */
+	tp4desc.addr = rx_buffer->tp4_index;
+	err = tp4ring_add_used(rx_ring->rx_tp4q, &tp4desc, 1);
+	if (err) {
+		/* Can we do something sane here? Maybe remove... */
+		dev_err(&rx_ring->vsi->back->pdev->dev, "TP4 queue is full!\n");
+	}
+
+	if (i40e_is_non_eop(rx_ring, rx_desc, NULL)) {
+		/* We received non-EOP. Not handled. What is a good
+                 * way to handle this? */
+		dev_err(&rx_ring->vsi->back->pdev->dev, "Got non-EOP on DDMA!\n");
+	}
+
+	return (int)size;
+}
+
 /**
  * i40e_clean_rx_irq - Clean completed descriptors from Rx ring - bounce buf
  * @rx_ring: rx descriptor ring to transact packets on
@@ -1763,6 +1839,18 @@ static int i40e_clean_rx_irq(struct i40e_ring *rx_ring, int budget)
 		 * DD bit is set.
 		 */
 		dma_rmb();
+
+		if (rx_ring->ddma) {
+			int len = i40e_do_ddma(rx_ring, rx_desc);
+
+			if (len) {
+				total_rx_packets++;
+				total_rx_bytes += len;
+				cleaned_count++;
+				continue;
+			}
+			break;
+		}
 
 		skb = i40e_fetch_rx_buffer(rx_ring, rx_desc);
 		if (!skb)

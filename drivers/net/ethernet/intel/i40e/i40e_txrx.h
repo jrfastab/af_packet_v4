@@ -244,6 +244,7 @@ struct i40e_rx_buffer {
 	dma_addr_t dma;
 	struct page *page;
 	unsigned int page_offset;
+	unsigned long tp4_index; /* so we can complete to user land */
 };
 
 struct i40e_queue_stats {
@@ -341,6 +342,14 @@ struct i40e_ring {
 
 	struct rcu_head rcu;		/* to avoid race on free */
 	u16 next_to_alloc;
+
+	/* TPACKET V4 */
+	bool ddma;
+	struct tpacket4_queue_kernel *rx_tp4q;
+	struct tpacket4_buffers *tp4_bufs;
+	struct i40e_rx_buffer *tp4_bufs_bi;
+	/* TODO (bt) possibility to poke poll table */
+
 } ____cacheline_internodealigned_in_smp;
 
 enum i40e_latency_range {
