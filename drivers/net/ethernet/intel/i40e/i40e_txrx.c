@@ -1198,6 +1198,25 @@ static void i40e_receive_skb(struct i40e_ring *rx_ring,
 	napi_gro_receive(&q_vector->napi, skb);
 }
 
+#define DNA_BATCHING 1
+
+#if DNA_BATCHING
+static inline int i40e_get_page_from_tp4desc(struct i40e_ring *rx_ring,
+					     struct i40e_rx_buffer *bi,
+					     struct tpacket4_desc *desc)
+{
+	unsigned long idx = desc->addr;
+
+	if (idx >= rx_ring->tp4_bufs->npages)
+		return false;
+
+	bi->dma = rx_ring->tp4_bufs_bi[idx].dma;
+	bi->page = rx_ring->tp4_bufs_bi[idx].page;
+	bi->page_offset = 0;
+	bi->tp4_index = idx;
+	return true;
+}
+#else
 static bool i40_get_page_from_tp4(struct i40e_ring *rx_ring,
 				  struct i40e_rx_buffer *bi)
 {
@@ -1219,6 +1238,7 @@ static bool i40_get_page_from_tp4(struct i40e_ring *rx_ring,
 	bi->tp4_index = idx;
 	return true;
 }
+#endif
 
 /**
  * i40e_alloc_rx_buffers - Replace used receive buffers
@@ -1232,7 +1252,10 @@ bool i40e_alloc_rx_buffers(struct i40e_ring *rx_ring, u16 cleaned_count)
 	u16 ntu = rx_ring->next_to_use;
 	union i40e_rx_desc *rx_desc;
 	struct i40e_rx_buffer *bi;
-
+#if DNA_BATCHING
+	struct tpacket4_desc descs[I40E_RX_BUFFER_WRITE];
+	int i, ndescs;
+#endif
 	/* do nothing if no valid netdev defined */
 	if (!rx_ring->netdev || !cleaned_count)
 		return false;
@@ -1240,11 +1263,35 @@ bool i40e_alloc_rx_buffers(struct i40e_ring *rx_ring, u16 cleaned_count)
 	rx_desc = I40E_RX_DESC(rx_ring, ntu);
 	bi = &rx_ring->rx_bi[ntu];
 
+#if DNA_BATCHING
+	if (likely(rx_ring->ddma)) {
+		ndescs = tp4ring_get_avail(rx_ring->rx_tp4q, &descs[0], 
+					   min((int)cleaned_count, I40E_RX_BUFFER_WRITE));
+		if (ndescs == 0)
+			goto no_buffers;
+		i = 0;
+	}
+#endif
 	do {
-		if (rx_ring->ddma) {
+		if (likely(rx_ring->ddma)) {
+#if DNA_BATCHING
+			if (unlikely(!ndescs)) {
+				ndescs = tp4ring_get_avail(rx_ring->rx_tp4q, &descs[0], 
+							   min((int)cleaned_count, I40E_RX_BUFFER_WRITE));
+				if (ndescs == 0)
+					goto no_buffers;
+				i = 0;
+			}
+			if (unlikely(!i40e_get_page_from_tp4desc(rx_ring, bi, &descs[i])))
+				goto no_buffers;
+			i++; 
+			ndescs--;
+#else
 			/* TODO (bt) Don't pull one at a time... */
 			if (!i40_get_page_from_tp4(rx_ring, bi))
 				goto no_buffers;
+#endif
+
 		} else {
 			if (!i40e_alloc_mapped_page(rx_ring, bi))
 				goto no_buffers;
@@ -1774,6 +1821,8 @@ static int i40e_do_ddma(struct i40e_ring *rx_ring,
 				PAGE_SIZE,
 				DMA_FROM_DEVICE);
 
+
+	/* DNA_BATCHING here we pass, one by one... how to improve? */
 	/* Pass the frame to userland */
 	tp4desc.addr = rx_buffer->tp4_index;
 	err = tp4ring_add_used(rx_ring->rx_tp4q, &tp4desc, 1);
@@ -1840,6 +1889,7 @@ static int i40e_clean_rx_irq(struct i40e_ring *rx_ring, int budget)
 		 */
 		dma_rmb();
 
+		/* DNA_BATCHING should be done here, but we need some serious restructure. */
 		if (rx_ring->ddma) {
 			int len = i40e_do_ddma(rx_ring, rx_desc);
 
