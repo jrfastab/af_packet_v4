@@ -1265,7 +1265,7 @@ bool i40e_alloc_rx_buffers(struct i40e_ring *rx_ring, u16 cleaned_count)
 
 #if DNA_BATCHING
 	if (likely(rx_ring->ddma)) {
-		ndescs = tp4ring_get_avail(rx_ring->rx_tp4q, &descs[0], 
+		ndescs = tp4ring_get_avail(rx_ring->rx_tp4q, &descs[0],
 					   min((int)cleaned_count, I40E_RX_BUFFER_WRITE));
 		if (ndescs == 0)
 			goto no_buffers;
@@ -1276,7 +1276,7 @@ bool i40e_alloc_rx_buffers(struct i40e_ring *rx_ring, u16 cleaned_count)
 		if (likely(rx_ring->ddma)) {
 #if DNA_BATCHING
 			if (unlikely(!ndescs)) {
-				ndescs = tp4ring_get_avail(rx_ring->rx_tp4q, &descs[0], 
+				ndescs = tp4ring_get_avail(rx_ring->rx_tp4q, &descs[0],
 							   min((int)cleaned_count, I40E_RX_BUFFER_WRITE));
 				if (ndescs == 0)
 					goto no_buffers;
@@ -1284,7 +1284,7 @@ bool i40e_alloc_rx_buffers(struct i40e_ring *rx_ring, u16 cleaned_count)
 			}
 			if (unlikely(!i40e_get_page_from_tp4desc(rx_ring, bi, &descs[i])))
 				goto no_buffers;
-			i++; 
+			i++;
 			ndescs--;
 #else
 			/* TODO (bt) Don't pull one at a time... */
@@ -1800,12 +1800,11 @@ static bool i40e_is_non_eop(struct i40e_ring *rx_ring,
 }
 
 static int i40e_do_ddma(struct i40e_ring *rx_ring,
-			union i40e_rx_desc *rx_desc)
+			union i40e_rx_desc *rx_desc,
+			struct i40e_rx_buffer **return_rx_buffer)
 {
 	struct i40e_rx_buffer *rx_buffer;
 	struct page *page;
-	struct tpacket4_desc tp4desc = {};
-	int err;
 	u64 qword = le64_to_cpu(rx_desc->wb.qword1.status_error_len);
 	unsigned int size = (qword & I40E_RXD_QW1_LENGTH_PBUF_MASK) >>
 			    I40E_RXD_QW1_LENGTH_PBUF_SHIFT;
@@ -1822,15 +1821,7 @@ static int i40e_do_ddma(struct i40e_ring *rx_ring,
 				DMA_FROM_DEVICE);
 
 
-	/* DNA_BATCHING here we pass, one by one... how to improve? */
-	/* Pass the frame to userland */
-	tp4desc.addr = rx_buffer->tp4_index;
-	err = tp4ring_add_used(rx_ring->rx_tp4q, &tp4desc, 1);
-	if (err) {
-		/* Can we do something sane here? Maybe remove... */
-		dev_err(&rx_ring->vsi->back->pdev->dev, "TP4 queue is full!\n");
-	}
-
+	*return_rx_buffer = rx_buffer;
 	if (i40e_is_non_eop(rx_ring, rx_desc, NULL)) {
 		/* We received non-EOP. Not handled. What is a good
                  * way to handle this? */
@@ -1838,6 +1829,23 @@ static int i40e_do_ddma(struct i40e_ring *rx_ring,
 	}
 
 	return (int)size;
+}
+
+static void pass_to_user_space(struct i40e_ring *rx_ring,
+			       struct tpacket4_desc *tp4desc,
+			       int dcnt)
+{
+	int err;
+
+	if (!rx_ring->rx_tp4q || dcnt == 0)
+		return;
+
+	/* Pass the frame to userland */
+	err = tp4ring_add_used(rx_ring->rx_tp4q, tp4desc, dcnt);
+	if (err) {
+		/* Can we do something sane here? Maybe remove... */
+		dev_err(&rx_ring->vsi->back->pdev->dev, "TP4 queue is full!\n");
+	}
 }
 
 /**
@@ -1857,6 +1865,12 @@ static int i40e_clean_rx_irq(struct i40e_ring *rx_ring, int budget)
 	unsigned int total_rx_bytes = 0, total_rx_packets = 0;
 	u16 cleaned_count = I40E_DESC_UNUSED(rx_ring);
 	bool failure = false;
+#if DNA_BATCHING
+	/* How to calculate this properly? It is dynamic right now */
+	struct tpacket4_desc tp4desc[NAPI_POLL_WEIGHT];
+#else
+	struct tpacket4_desc tp4desc = {};
+#endif
 
 	while (likely(total_rx_packets < budget)) {
 		union i40e_rx_desc *rx_desc;
@@ -1889,11 +1903,21 @@ static int i40e_clean_rx_irq(struct i40e_ring *rx_ring, int budget)
 		 */
 		dma_rmb();
 
-		/* DNA_BATCHING should be done here, but we need some serious restructure. */
 		if (rx_ring->ddma) {
-			int len = i40e_do_ddma(rx_ring, rx_desc);
+			struct i40e_rx_buffer *rx_buffer;
+			int len = i40e_do_ddma(rx_ring, rx_desc, &rx_buffer);
 
 			if (len) {
+#if DNA_BATCHING
+				tp4desc[total_rx_packets].addr =
+					rx_buffer->tp4_index;
+				tp4desc[total_rx_packets].len = 0;
+				tp4desc[total_rx_packets].flags = 0;
+				tp4desc[total_rx_packets].index = 0;
+#else
+				tp4desc.addr = rx_buffer->tp4_index;
+				pass_to_user_space(rx_ring, &tp4desc, 1);
+#endif
 				total_rx_packets++;
 				total_rx_bytes += len;
 				cleaned_count++;
@@ -1951,6 +1975,10 @@ static int i40e_clean_rx_irq(struct i40e_ring *rx_ring, int budget)
 		/* update budget accounting */
 		total_rx_packets++;
 	}
+
+#if DNA_BATCHING
+	pass_to_user_space(rx_ring, &tp4desc[0], total_rx_packets);
+#endif
 
 	u64_stats_update_begin(&rx_ring->syncp);
 	rx_ring->stats.packets += total_rx_packets;
