@@ -293,7 +293,8 @@ int tp4ring_add_used(struct tpacket4_queue_kernel *q,
 
 	smp_wmb();
 
-	for (i = dcnt; i >= 0; i--) {
+	/* NOTE: We're not checking dcnt against zero... */
+	for (i = dcnt - 1; i >= 0; i--) {
 		unsigned int idx = (q->used_idx + i) & (q->ring_size - 1);
 
 		q->vring[idx].flags = d[i].flags & ~DESC_HW;
